@@ -360,6 +360,8 @@ class Charge(StripeObject):
         # All exceptions must be raised before this point.
         super().__init__()
 
+        self._authorized = not source._charging_is_declined()
+
         self.amount = amount
         self.currency = currency
         self.customer = customer
@@ -378,8 +380,7 @@ class Charge(StripeObject):
     def _trigger_payment(self, on_success=None, on_failure_now=None,
                          on_failure_later=None):
         if self.payment_method.startswith('src_'):
-            source = Source._api_retrieve(self.payment_method)
-            if source._charging_is_declined():
+            if not self._authorized:
                 async def callback():
                     await asyncio.sleep(0.5)
                     self.status = 'failed'
@@ -395,10 +396,7 @@ class Charge(StripeObject):
 
         elif (self.payment_method.startswith('pm_') or
               self.payment_method.startswith('card_')):
-            pm = (Card._api_retrieve(self.payment_method)
-                  if self.payment_method.startswith('card_')
-                  else PaymentMethod._api_retrieve(self.payment_method))
-            if pm._charging_is_declined():
+            if not self._authorized:
                 self.status = 'failed'
                 self.failure_code = 'card_declined'
                 self.failure_message = 'Your card was declined.'
@@ -408,6 +406,25 @@ class Charge(StripeObject):
                 self.status = 'succeeded'
                 if on_success:
                     on_success()
+
+    @classmethod
+    def _api_create(cls, **data):
+        obj = super()._api_create(**data)
+
+        # for successful pre-auth, return unpaid charge
+        if not obj.captured and obj._authorized:
+            return obj
+
+        def on_failure():
+            raise UserError(402, 'Your card was declined.',
+                            {'code': 'card_declined', 'charge': obj.id})
+
+        obj._trigger_payment(
+            on_failure_now=on_failure,
+            on_failure_later=on_failure
+        )
+
+        return obj
 
     @classmethod
     def _api_capture(cls, id, amount=None, **kwargs):
@@ -508,13 +525,16 @@ class Customer(StripeObject):
     object = 'customer'
     _id_prefix = 'cus_'
 
-    def __init__(self, description=None, email=None, invoice_settings=None,
-                 business_vat_id=None, preferred_locales=None,
-                 tax_id_data=None, metadata=None, **kwargs):
+    def __init__(self, name=None, description=None, email=None,
+                 invoice_settings=None, business_vat_id=None,
+                 preferred_locales=None, tax_id_data=None,
+                 metadata=None, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
         try:
+            if name is not None:
+                assert type(name) is str
             if description is not None:
                 assert type(description) is str
             if email is not None:
@@ -547,6 +567,7 @@ class Customer(StripeObject):
         # All exceptions must be raised before this point.
         super().__init__()
 
+        self.name = name or ''
         self.description = description or ''
         self.email = email or ''
         self.invoice_settings = invoice_settings
@@ -2002,18 +2023,22 @@ class Subscription(StripeObject):
     def __init__(self, customer=None, metadata=None, items=None,
                  tax_percent=None,  # deprecated
                  enable_incomplete_payments=True,  # legacy support
-                 payment_behavior='allow_incomplete', **kwargs):
+                 payment_behavior='allow_incomplete',
+                 trial_period_days=None, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
         tax_percent = try_convert_to_float(tax_percent)
         enable_incomplete_payments = try_convert_to_bool(
             enable_incomplete_payments)
+        trial_period_days = try_convert_to_int(trial_period_days)
         try:
             assert type(customer) is str and customer.startswith('cus_')
             if tax_percent is not None:
                 assert type(tax_percent) is float
                 assert tax_percent >= 0 and tax_percent <= 100
+            if trial_period_days is not None:
+                assert type(trial_period_days) is int
             assert type(items) is list
             for item in items:
                 assert type(item.get('plan', None)) is str
@@ -2058,12 +2083,15 @@ class Subscription(StripeObject):
         self.status = 'incomplete'
         self.trial_end = None
         self.trial_start = None
+        self.trial_period_days = trial_period_days
         self.latest_invoice = None
         self._enable_incomplete_payments = (
             enable_incomplete_payments and
             payment_behavior != 'error_if_incomplete')
 
-        self._set_up_subscription_and_invoice(items[0])
+        create_an_invoice = \
+            self.trial_end is None and self.trial_period_days is None
+        self._set_up_subscription_and_invoice(items[0], create_an_invoice)
         self.start = self.current_period_start
 
         schedule_webhook(Event('customer.subscription.created', self))
