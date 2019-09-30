@@ -526,6 +526,7 @@ class Customer(StripeObject):
     _id_prefix = 'cus_'
 
     def __init__(self, name=None, description=None, email=None,
+                 address=None,
                  invoice_settings=None, business_vat_id=None,
                  preferred_locales=None, tax_id_data=None,
                  metadata=None, **kwargs):
@@ -579,6 +580,7 @@ class Customer(StripeObject):
         self.discount = None
         self.shipping = None
         self.default_source = None
+        self.address = address or None
 
         self.sources = List('/v1/customers/' + self.id + '/sources')
         self.tax_ids = List('/v1/customers/' + self.id + '/tax_ids')

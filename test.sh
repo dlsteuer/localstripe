@@ -8,6 +8,12 @@ SK=sk_test_12345
 
 cus=$(curl -sSf -u $SK: $HOST/v1/customers \
           -d email=james.robinson@example.com \
+          -d "address[line1]=123 Maple St" \
+          -d "address[line2]=Unit 6" \
+          -d "address[city]=Vancouver" \
+          -d "address[state]=BC" \
+          -d "address[country]=Canada" \
+          -d "address[postal_code]=V9X6T4" \
       | grep -oE 'cus_\w+' | head -n 1)
 
 curl -sSf -u $SK: $HOST/v1/customers/$cus \
