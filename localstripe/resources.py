@@ -624,6 +624,10 @@ class Customer(StripeObject):
                 data['invoice_settings'].get('default_payment_method') == ''):
             data['invoice_settings']['default_payment_method'] = None
 
+        if ('source' in data):
+            cls._api_add_source(id, data['source'])
+            del data['source']
+
         obj = super()._api_update(id, **data)
         schedule_webhook(Event('customer.updated', obj))
         return obj
@@ -2082,8 +2086,12 @@ class Subscription(StripeObject):
         self.discount = None
         self.ended_at = None
         self.quantity = items[0]['quantity']
-        self.status = 'incomplete'
-        self.trial_end = None
+        self.status = \
+            'trialing' if trial_period_days is not None else 'incomplete'
+        self.trial_end = \
+            int((datetime.now()
+                 + timedelta(days=trial_period_days)).timestamp()) \
+            if trial_period_days is not None else None
         self.trial_start = None
         self.trial_period_days = trial_period_days
         self.latest_invoice = None
