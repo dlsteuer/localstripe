@@ -2030,7 +2030,7 @@ class Subscription(StripeObject):
                  tax_percent=None,  # deprecated
                  enable_incomplete_payments=True,  # legacy support
                  payment_behavior='allow_incomplete',
-                 trial_period_days=None, **kwargs):
+                 trial_period_days=None, trial_end=None, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
@@ -2038,6 +2038,7 @@ class Subscription(StripeObject):
         enable_incomplete_payments = try_convert_to_bool(
             enable_incomplete_payments)
         trial_period_days = try_convert_to_int(trial_period_days)
+        trial_end = try_convert_to_int(trial_end)
         try:
             assert type(customer) is str and customer.startswith('cus_')
             if tax_percent is not None:
@@ -2045,6 +2046,8 @@ class Subscription(StripeObject):
                 assert tax_percent >= 0 and tax_percent <= 100
             if trial_period_days is not None:
                 assert type(trial_period_days) is int
+            if trial_end is not None:
+                assert type(trial_end) is int
             assert type(items) is list
             for item in items:
                 assert type(item.get('plan', None)) is str
@@ -2091,7 +2094,7 @@ class Subscription(StripeObject):
         self.trial_end = \
             int((datetime.now()
                  + timedelta(days=trial_period_days)).timestamp()) \
-            if trial_period_days is not None else None
+            if trial_period_days is not None else trial_end
         self.trial_start = None
         self.trial_period_days = trial_period_days
         self.latest_invoice = None
@@ -2135,6 +2138,11 @@ class Subscription(StripeObject):
                 quantity=item['quantity'],
                 tax_rates=item['tax_rates']))
 
+
+        if create_an_invoice:
+            self._create_invoice()
+
+    def _create_invoice(self):
         invoice_items = []
 
         # Get previous invoice for this subscription and customer, and
@@ -2153,43 +2161,42 @@ class Subscription(StripeObject):
                             tax_rates=previous_tax_rates,
                             customer=self.customer))
 
-        if create_an_invoice:
-            for si in self.items._list:
-                invoice_items.append(
-                    InvoiceItem(subscription=self.id, plan=si.plan.id,
-                                amount=si._calculate_amount(),
-                                currency=si.plan.currency,
-                                description=si.plan.name,
-                                tax_rates=[tr.id
-                                           for tr in (si.tax_rates or [])],
-                                customer=self.customer,
-                                period_start=self.current_period_start,
-                                period_end=self.current_period_end))
+        for si in self.items._list:
+            invoice_items.append(
+                InvoiceItem(subscription=self.id, plan=si.plan.id,
+                            amount=si._calculate_amount(),
+                            currency=si.plan.currency,
+                            description=si.plan.name,
+                            tax_rates=[tr.id
+                                       for tr in (si.tax_rates or [])],
+                            customer=self.customer,
+                            period_start=self.current_period_start,
+                            period_end=self.current_period_end))
 
-            # Create associated invoice
-            invoice = Invoice(
-                customer=self.customer,
-                subscription=self.id,
-                items=invoice_items,
-                tax_percent=self.tax_percent,
-                date=self.current_period_start)
-            self.latest_invoice = invoice.id
-            invoice._finalize()
-            if invoice.status != 'paid':  # 0 € invoices are already 'paid'
-                Invoice._api_pay_invoice(invoice.id)
+        # Create associated invoice
+        invoice = Invoice(
+            customer=self.customer,
+            subscription=self.id,
+            items=invoice_items,
+            tax_percent=self.tax_percent,
+            date=self.current_period_start)
+        self.latest_invoice = invoice.id
+        invoice._finalize()
+        if invoice.status != 'paid':  # 0 € invoices are already 'paid'
+            Invoice._api_pay_invoice(invoice.id)
 
-            if invoice.status == 'paid':
+        if invoice.status == 'paid':
+            self.status = 'active'
+        elif invoice.charge:
+            if invoice.charge.status == 'failed':
+                if self.status != 'incomplete':
+                    self._on_recurring_payment_failure(invoice)
+            # If source is SEPA, subscription starts `active` (even with
+            # `enable_incomplete_payments`), then is canceled later if the
+            # payment fails:
+            if (invoice.charge.status == 'pending' and
+                    invoice.charge.payment_method.startswith('src_')):
                 self.status = 'active'
-            elif invoice.charge:
-                if invoice.charge.status == 'failed':
-                    if self.status != 'incomplete':
-                        self._on_recurring_payment_failure(invoice)
-                # If source is SEPA, subscription starts `active` (even with
-                # `enable_incomplete_payments`), then is canceled later if the
-                # payment fails:
-                if (invoice.charge.status == 'pending' and
-                        invoice.charge.payment_method.startswith('src_')):
-                    self.status = 'active'
 
     def _on_initial_payment_success(self, invoice):
         self.status = 'active'
@@ -2218,11 +2225,14 @@ class Subscription(StripeObject):
         self.status = 'past_due'
 
     def _update(self, metadata=None, items=None, tax_percent=None,
-                proration_date=None,
+                proration_date=None, trial_end=None,
                 # Currently unimplemented, only False works as expected:
                 enable_incomplete_payments=False):
         tax_percent = try_convert_to_float(tax_percent)
         proration_date = try_convert_to_int(proration_date)
+        if trial_end == "now":
+            trial_end = datetime.now().timestamp()
+        trial_end = try_convert_to_int(trial_end)
         try:
             if tax_percent is not None:
                 assert type(tax_percent) is float
@@ -2230,6 +2240,8 @@ class Subscription(StripeObject):
             if proration_date is not None:
                 assert type(proration_date) is int
                 assert proration_date > 1500000000
+            if trial_end is not None:
+                assert type(trial_end) is int
             if items is not None:
                 assert type(items) is list
                 for item in items:
@@ -2254,25 +2266,34 @@ class Subscription(StripeObject):
         if tax_percent is not None:
             self.tax_percent = tax_percent
 
-        if items is None or len(items) != 1 or not items[0]['plan']:
-            raise UserError(500, 'Not implemented')
+        create_an_invoice = False
+        if items is not None and len(items) == 1:
+            # To return 404 if not existant:
+            new_plan = Plan._api_retrieve(items[0]['plan'])
+            # To return 404 if not existant:
+            if items[0]['tax_rates'] is not None:
+                [TaxRate._api_retrieve(tr) for tr in items[0]['tax_rates']]
 
-        # To return 404 if not existant:
-        new_plan = Plan._api_retrieve(items[0]['plan'])
-        # To return 404 if not existant:
-        if items[0]['tax_rates'] is not None:
-            [TaxRate._api_retrieve(tr) for tr in items[0]['tax_rates']]
+            self.quantity = items[0]['quantity']
 
-        self.quantity = items[0]['quantity']
+            # If the subscription is updated to a more expensive plan, an invoice
+            # is not automatically generated. To achieve that, an invoice has to
+            # be manually created using the POST /invoices route.
+            create_an_invoice = self.plan.billing_scheme == 'per_unit' and (
+                self.plan.interval != new_plan.interval or
+                self.plan.interval_count != new_plan.interval_count)
 
-        # If the subscription is updated to a more expensive plan, an invoice
-        # is not automatically generated. To achieve that, an invoice has to
-        # be manually created using the POST /invoices route.
-        create_an_invoice = self.plan.billing_scheme == 'per_unit' and (
-            self.plan.interval != new_plan.interval or
-            self.plan.interval_count != new_plan.interval_count)
-        self._set_up_subscription_and_invoice(
-            items[0], create_an_invoice=create_an_invoice)
+            self._set_up_subscription_and_invoice(
+                items[0], create_an_invoice=create_an_invoice)
+
+        self.trial_end = trial_end
+        old_status = self.status
+        if self.trial_end is not None:
+            self.status = 'active'
+
+        if old_status == 'trialing' and self.status == 'active':
+            self._create_invoice()
+
 
     @classmethod
     def _api_delete(cls, id):
